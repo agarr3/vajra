@@ -4,6 +4,9 @@ from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
 from torch.utils.data.sampler import SequentialSampler
+import numpy as np
+
+from FeatureExtraction.FeatureExtraction import ExtractorFactory, FEATURES
 
 
 class CapsuleNetworkConfig:
@@ -70,7 +73,8 @@ class CapsuleNetwork(torch.nn.Module):
                                       torch.nn.Linear(1024, self.configuration.input_height * self.configuration.input_width),
                                       torch.nn.Sigmoid())
 
-    def forward(self, input, labels):
+    def forward(self, input, labels = None):
+
         conv_out_1 = torch.relu(self.conv_layer_1(input))
         conv_out_2 = [conv(conv_out_1) for conv in self.conv_stack]
 
@@ -151,7 +155,7 @@ class CapsuleNetwork(torch.nn.Module):
         unit_vector = tensor / safe_norm
         return squash_factor * unit_vector
 
-class CustomDataset(Dataset):
+class CustomDatasetMnist(Dataset):
 
     def __init__(self, dataList, labelList, channels, height, width):
         self.data = dataList
@@ -168,7 +172,29 @@ class CustomDataset(Dataset):
 
         label = torch.tensor(self.labels[index])
 
-        return data, label
+        return data, label, True
+
+class CustomDatasetMelTest(Dataset):
+
+    def __init__(self, dataList, labelList):
+        self.data = dataList
+        self.labels = labelList
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        fileName = self.data[index]
+        # featureExtractor = ExtractorFactory.getExtractor(feature=FEATURES.LOG_MEL_SPECTOGRAM)
+        # mel_spect, sr = featureExtractor.convertSingleAudioFile(audio_file_path=fileName)
+
+        mel_spect = np.load(fileName)
+        data = torch.tensor(mel_spect, dtype=torch.float)
+        data = torch.unsqueeze(data, dim =0)
+
+        label = torch.tensor(self.labels[index])
+
+        return data, label, False
 
 class CapsuleNWDriver:
 
@@ -183,12 +209,17 @@ class CapsuleNWDriver:
         model.zero_grad()
 
         for step, batch in torch.hub.tqdm(enumerate(train_data_loader),desc="running training for epoch {}".format(epoch)):
-            data, label = batch
+            data, label, labelFlag = batch
 
-            inputs = {
-                "input": data,
-                "labels": label
-            }
+            if all(labelFlag):
+                inputs = {
+                    "input": data,
+                    "labels": label
+                }
+            else:
+                inputs = {
+                    "input": data
+                }
 
             predictions, loss = model(**inputs)
             loss.backward()
@@ -205,7 +236,7 @@ class CapsuleNWDriver:
                                        batch_size=self.configuration.TRAIN_BATCH_SIZE,
                                        sampler=SequentialSampler(test_data_set), drop_last=False)
 
-        model = CapsuleNetwork(in_channels=1)
+        model = CapsuleNetwork(in_channels=1, configuration=self.configuration)
         optimizer = torch.optim.Adam(model.parameters())
 
         savedEpoch = 0
@@ -213,14 +244,32 @@ class CapsuleNWDriver:
             self.run_training_epoch(epoch, model, train_data_loader, test_data_loader, optimizer)
 
 
-mndata = MNIST('/Users/ragarwal/PycharmProjects/vajra/mnist-data')
-train_images, train_labels = mndata.load_training()
-val_images, val_labels = mndata.load_testing()
+#dataset = "MNIST"
+dataset = "MELTEST"
 
-train_dataset = CustomDataset(train_images, train_labels, 1, 28, 28)
-val_dataset = CustomDataset(val_images, val_labels, 1, 28, 28)
+if dataset == "MNIST":
+    mndata = MNIST('/Users/ragarwal/PycharmProjects/vajra/mnist-data')
+    train_images, train_labels = mndata.load_training()
+    val_images, val_labels = mndata.load_testing()
 
-driver = CapsuleNWDriver(mode = "train")
-driver.train(train_dataset, val_dataset)
+    train_dataset = CustomDatasetMnist(train_images, train_labels, 1, 28, 28)
+    val_dataset = CustomDatasetMnist(val_images, val_labels, 1, 28, 28)
+
+    driver = CapsuleNWDriver(mode = "train")
+    driver.train(train_dataset, val_dataset)
+elif dataset == "MELTEST":
+    train_data = ["/Users/ragarwal/PycharmProjects/vajra/data/intro25-sonicide.npy"]*50
+    labels = [1] * 50
+
+    train_dataset = CustomDatasetMelTest(train_data, labels)
+
+    configuration = CapsuleNetworkConfig()
+    configuration.input_height = 128
+    configuration.input_width = 776
+
+    driver = CapsuleNWDriver(mode="train", configuration= configuration)
+    driver.train(train_dataset, train_dataset)
+
+
 
 print("Hi")
