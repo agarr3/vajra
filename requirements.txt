@@ -3,3 +3,7 @@
  matplotlib==3.3.2
  jupyter==1.0.0
  librosa==0.8.0
+ #conda install pytorch==1.6.0 torchvision==0.7.0 -c pytorch
+ tqdm==4.54.1
+ mnist==0.2.2
+ python-mnist==0.7
