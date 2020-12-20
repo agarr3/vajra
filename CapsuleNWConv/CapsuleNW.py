@@ -6,7 +6,7 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.sampler import SequentialSampler
 import numpy as np
 
-from FeatureExtraction.FeatureExtraction import ExtractorFactory, FEATURES
+USE_CUDA = True if torch.cuda.is_available() else False
 
 
 class CapsuleNetworkConfig:
@@ -35,7 +35,7 @@ class CapsuleNetworkConfig:
 
     alpha = 0.0005
 
-    TRAIN_BATCH_SIZE = 100
+    TRAIN_BATCH_SIZE = 1
     EPOCHS = 20
 
 
@@ -92,6 +92,9 @@ class CapsuleNetwork(torch.nn.Module):
 
         b_ij = torch.autograd.Variable(torch.zeros(batch_size, self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number, 1, 1))
 
+        if USE_CUDA:
+            b_ij = b_ij.cuda()
+
         for i in range(self.configuration.routing_iterations):
             c_ij = torch.softmax(b_ij, dim=2)
             s_j = (c_ij * u_hat)
@@ -110,8 +113,10 @@ class CapsuleNetwork(torch.nn.Module):
 
         margin_loss = 0
         if labels is not None:
-            T = labels
-            T = torch.eye(10).index_select(dim=0, index=T)
+            T = torch.eye(10)
+            if USE_CUDA:
+                T = T.cuda()
+            T = T.index_select(dim=0, index=labels)
             correct_loss = torch.relu(self.configuration.m_plus - v_k).pow(2).view(batch_size, -1)
             incorrect_loss = torch.relu(v_k - self.configuration.m_minus).pow(2).view(batch_size, -1)
             margin_loss = T * correct_loss + self.configuration.lambda_ * (1 - T) * incorrect_loss
@@ -122,6 +127,8 @@ class CapsuleNetwork(torch.nn.Module):
         classes = torch.sqrt((v_j ** 2).sum(dim=2, keepdim=False))
         _, max_length_indices = classes.max(dim=1)
         masked = torch.autograd.Variable(torch.eye(10))
+        if USE_CUDA:
+            masked = masked.cuda()
         masked = masked.index_select(dim=0, index=max_length_indices.squeeze(1).data)
         decoder_input = v_j * masked[:, :, None, None]
 
@@ -211,6 +218,9 @@ class CapsuleNWDriver:
         for step, batch in torch.hub.tqdm(enumerate(train_data_loader),desc="running training for epoch {}".format(epoch)):
             data, label, labelFlag = batch
 
+            if USE_CUDA:
+                data, label = data.cuda(), label.cuda()
+
             if all(labelFlag):
                 inputs = {
                     "input": data,
@@ -237,6 +247,9 @@ class CapsuleNWDriver:
                                        sampler=SequentialSampler(test_data_set), drop_last=False)
 
         model = CapsuleNetwork(in_channels=1, configuration=self.configuration)
+        if USE_CUDA:
+            model = model.cuda()
+
         optimizer = torch.optim.Adam(model.parameters())
 
         savedEpoch = 0
@@ -244,8 +257,8 @@ class CapsuleNWDriver:
             self.run_training_epoch(epoch, model, train_data_loader, test_data_loader, optimizer)
 
 
-#dataset = "MNIST"
-dataset = "MELTEST"
+dataset = "MNIST"
+#dataset = "MELTEST"
 
 if dataset == "MNIST":
     mndata = MNIST('/Users/ragarwal/PycharmProjects/vajra/mnist-data')
@@ -258,7 +271,7 @@ if dataset == "MNIST":
     driver = CapsuleNWDriver(mode = "train")
     driver.train(train_dataset, val_dataset)
 elif dataset == "MELTEST":
-    train_data = ["/Users/ragarwal/PycharmProjects/vajra/data/intro25-sonicide.npy"]*50
+    train_data = [".././data/intro25-sonicide.npy"]*50
     labels = [1] * 50
 
     train_dataset = CustomDatasetMelTest(train_data, labels)
