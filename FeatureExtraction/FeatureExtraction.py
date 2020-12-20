@@ -93,6 +93,7 @@ class LogMelSpectogramLibrosa(BaseFeatureExtractor):
             return mel_spect, sr
         else:
             np.save(save_file_path, mel_spect)
+            return mel_spect, sr
 
     def convertAllAudioInDir(self, source_dir_path, destination_dir_path):
         pass
