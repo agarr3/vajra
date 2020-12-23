@@ -86,7 +86,7 @@ class LogMelSpectogramLibrosa(BaseFeatureExtractor):
 
     def convertSingleAudioFile(self, audio_file_path, save_file_path=None):
         y, sr = librosa.load(audio_file_path)
-        spect = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=2048, hop_length=1024)
+        spect = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=2048, hop_length=1024, n_mels=24)
         #mel_spect = librosa.power_to_db(spect, ref=np.max)
         mel_spect = spect
         if not save_file_path:

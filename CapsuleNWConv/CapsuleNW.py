@@ -1,3 +1,6 @@
+import os
+import shutil
+
 import torch
 from mnist import MNIST
 from torch.utils.data import Dataset
@@ -5,11 +8,15 @@ from torch.utils.data.dataloader import DataLoader
 
 from torch.utils.data.sampler import SequentialSampler
 import numpy as np
+from torchvision.utils import save_image
+
+from pytorchtools import ModelCheckPointer, EarlyStoppingAndCheckPointer
 
 USE_CUDA = True if torch.cuda.is_available() else False
 
 
 class CapsuleNetworkConfig:
+    in_channels = 1
     input_height = 28
     input_width = 28
 
@@ -35,21 +42,26 @@ class CapsuleNetworkConfig:
 
     alpha = 0.0005
 
-    TRAIN_BATCH_SIZE = 1
-    EPOCHS = 20
+    TRAIN_BATCH_SIZE = 100
+    EPOCHS = 5
+    PATIENCE = 5
+    LEARNING_RATE = 1e-05
+
+    base_dir = ".././models/mnist"
 
 
 class CapsuleNetwork(torch.nn.Module):
 
-    def __init__(self, in_channels, configuration=None):
+    def __init__(self, configuration=None):
 
         super(CapsuleNetwork, self).__init__()
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         if configuration:
             self.configuration = configuration
         else:
             self.configuration = CapsuleNetworkConfig()
 
-        self.conv_layer_1 = torch.nn.Conv2d(in_channels=in_channels, out_channels=self.configuration.num_features_layer1, kernel_size=self.configuration.kernel_size_layer1, stride=self.configuration.stride_layer1, padding=self.configuration.padding_layer1)
+        self.conv_layer_1 = torch.nn.Conv2d(in_channels=self.configuration.in_channels, out_channels=self.configuration.num_features_layer1, kernel_size=self.configuration.kernel_size_layer1, stride=self.configuration.stride_layer1, padding=self.configuration.padding_layer1)
 
         self.conv_stack = torch.nn.ModuleList([torch.nn.Conv2d(in_channels=self.configuration.num_features_layer1,
                          out_channels=self.configuration.num_features_primary_cap,
@@ -64,7 +76,7 @@ class CapsuleNetwork(torch.nn.Module):
 
         self.configuration.primary_capsule_num = int(self.configuration.second_filter_height * self.configuration.second_filter_width * self.configuration.num_features_primary_cap)
 
-        self.prediction_w = torch.nn.parameter.Parameter(torch.randn([self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number, self.configuration.secondary_capsule_dim, self.configuration.primary_cap_dim]))
+        self.prediction_w = torch.nn.parameter.Parameter(torch.zeros([self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number, self.configuration.secondary_capsule_dim, self.configuration.primary_cap_dim]).to(self.device))
 
         self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(self.configuration.secondary_capsule_number * self.configuration.secondary_capsule_dim, 512),
                                       torch.nn.ReLU(inplace=True),
@@ -105,11 +117,11 @@ class CapsuleNetwork(torch.nn.Module):
             b_ij = b_ij + a_ij
 
         v_k, _ = self.safeNorm(v_j, dim=-2, keepdim=True)
-        prediction = torch.squeeze(v_k)
-
-        predictionList = []
-        for predictionForSingleInput in prediction:
-            predictionList.append(torch.argmax(predictionForSingleInput))
+        # prediction = torch.squeeze(v_k)
+        #
+        # predictionList = []
+        # for predictionForSingleInput in prediction:
+        #     predictionList.append(torch.argmax(predictionForSingleInput))
 
         margin_loss = 0
         if labels is not None:
@@ -142,12 +154,17 @@ class CapsuleNetwork(torch.nn.Module):
         reconstruction_loss = mse(decoder_output, input.view(batch_size, -1))
         final_loss = margin_loss + (self.configuration.alpha * reconstruction_loss)
 
-        return torch.unsqueeze(max_length_indices, dim=-1), final_loss
+        return torch.squeeze(max_length_indices, dim=-1), final_loss, decoder_output
 
     def predict(self, inputs):
         with torch.no_grad():
-            predictions, loss = self.forward(inputs)
-            return predictions
+            input = inputs['input']
+            if "labels" in inputs.keys():
+                label = inputs['labels']
+            else:
+                label = None
+            predictions, loss, decoder_output = self.forward(input, label)
+            return predictions, loss, decoder_output
 
 
 
@@ -196,7 +213,7 @@ class CustomDatasetMelTest(Dataset):
         # mel_spect, sr = featureExtractor.convertSingleAudioFile(audio_file_path=fileName)
 
         mel_spect = np.load(fileName)
-        data = torch.tensor(mel_spect, dtype=torch.float)
+        data = torch.tensor(mel_spect[:24,:80], dtype=torch.float)
         data = torch.unsqueeze(data, dim =0)
 
         label = torch.tensor(self.labels[index])
@@ -205,15 +222,106 @@ class CustomDatasetMelTest(Dataset):
 
 class CapsuleNWDriver:
 
-    def __init__(self, mode, configuration= None):
+    def __init__(self, mode,  configuration= None, modelPath=None):
+
+
         if configuration:
             self.configuration = configuration
         else:
             self.configuration = CapsuleNetworkConfig()
 
-    def run_training_epoch(self, epoch, model, train_data_loader, test_data_loader, optimizer):
-        model.train()
-        model.zero_grad()
+        self.modelCheckpointer = ModelCheckPointer()
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.modelPath = modelPath
+        self.training_loss = []
+        self.test_loss = []
+        self.test_accuracy = []
+        self.train_acccuracy = []
+
+        if mode == "train":
+            self.model = CapsuleNetwork(configuration=self.configuration)
+            if self.modelPath is not None:
+                self.savedEpoch = self.modelCheckpointer.load_checkpoint(self.modelPath, self.model, self.device, optimizer=self.optimizer)
+            else:
+                optimizer_grouped_parameters = [{
+                    "params": [p for n, p in self.model.named_parameters()],
+                }]
+                self.optimizer = torch.optim.SGD(params=optimizer_grouped_parameters, lr=0.01, momentum=0.9)
+                if USE_CUDA:
+                    self.model = self.model.cuda()
+                self.savedEpoch = 0
+        elif mode == "eval":
+            if self.modelPath is not None:
+                self.modelCheckpointer.load_checkpoint(self.modelPath, self.model, self.device)
+            else:
+                self.modelCheckpointer.loadBestModel(self.configuration.base_dir, self.model, self.device)
+
+            self.model.eval()
+
+
+    def predict(self, input):
+        self.model.eval()
+        return self.model.predict(input)
+
+    def run_evaluation(self, epoch, test_data_loader, save_reconstruction=False):
+
+        total_test_loss = 0.0
+        total_test_accurate_matches = 0.0
+        global_step = 0
+
+        if save_reconstruction:
+            if self.modelPath is not None:
+                dir = self.modelPath
+            else:
+                dir = self.configuration.base_dir
+            target_dir = os.path.join(dir, "reconstruction_epoch_{}".format(epoch))
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+                os.makedirs(target_dir)
+            else:
+                os.makedirs(target_dir)
+
+        for step, batch in torch.hub.tqdm(enumerate(test_data_loader),desc="running evaluation for epoch {}".format(epoch)):
+            data, label, labelFlag = batch
+            if USE_CUDA:
+                data, label = data.cuda(), label.cuda()
+
+            if all(labelFlag):
+                inputs = {
+                    "input": data,
+                    "labels": label
+                }
+            else:
+                inputs = {
+                    "input": data
+                }
+
+            predictions, loss, decoder_output = self.predict(inputs)
+            total_test_loss = total_test_loss + loss.item()
+
+            if all(labelFlag):
+                total_test_accurate_matches = total_test_accurate_matches + (label == predictions).sum()
+
+            print('Epoch: {}, step: {},  Loss:  {}'.format(epoch, step, loss.item()))
+            global_step = global_step + 1
+            local_step=0
+            if save_reconstruction:
+                for image, label in zip(decoder_output, predictions):
+                    local_step = local_step + 1
+                    image = image.view(self.configuration.input_height, self.configuration.input_width)
+                    img_name = os.path.join(target_dir, "global_step_{}_local_step_{}_label_{}.png".format(global_step,local_step, label))
+                    save_image(image, str(img_name))
+
+        return total_test_loss, total_test_accurate_matches / len(test_data_loader), all(labelFlag)
+
+
+    def run_training_epoch(self, epoch, train_data_loader):
+        self.model.train()
+        self.model.zero_grad()
+
+        total_train_loss = 0.0
+        total_train_accurate_matches = 0.0
 
         for step, batch in torch.hub.tqdm(enumerate(train_data_loader),desc="running training for epoch {}".format(epoch)):
             data, label, labelFlag = batch
@@ -231,11 +339,17 @@ class CapsuleNWDriver:
                     "input": data
                 }
 
-            predictions, loss = model(**inputs)
+            predictions, loss, decoder_output = self.model(**inputs)
+            total_train_loss = total_train_loss + loss.item()
             loss.backward()
-            optimizer.step()
-            model.zero_grad()
+            self.optimizer.step()
+            self.model.zero_grad()
+
+            if all(labelFlag):
+                total_train_accurate_matches = total_train_accurate_matches + (label == predictions).sum()
+
             print('Epoch: {}, step: {},  Loss:  {}'.format(epoch, step, loss.item()))
+        return total_train_loss, total_train_accurate_matches/len(train_data_loader), all(labelFlag)
 
     def train(self, train_data_set, test_data_set):
         train_data_loader = DataLoader(train_data_set,
@@ -246,22 +360,34 @@ class CapsuleNWDriver:
                                        batch_size=self.configuration.TRAIN_BATCH_SIZE,
                                        sampler=SequentialSampler(test_data_set), drop_last=False)
 
-        model = CapsuleNetwork(in_channels=1, configuration=self.configuration)
-        if USE_CUDA:
-            model = model.cuda()
+        if self.modelPath is not None:
+            dir = self.modelPath
+        else:
+            dir = self.configuration.base_dir
 
-        optimizer = torch.optim.Adam(model.parameters())
+        early_stopping = EarlyStoppingAndCheckPointer(patience=self.configuration.PATIENCE, verbose=True,
+                                                      basedir=dir)
 
-        savedEpoch = 0
-        for epoch in torch.hub.tqdm(range(savedEpoch, self.configuration.EPOCHS), desc="running outer train loop"):
-            self.run_training_epoch(epoch, model, train_data_loader, test_data_loader, optimizer)
+        for epoch in torch.hub.tqdm(range(self.savedEpoch, self.configuration.EPOCHS), desc="running outer train loop"):
+            train_loss, train_accuracy, train_accuracyFlag = self.run_training_epoch(epoch, train_data_loader)
+            test_loss, test_accuracy, test_accuracyFlag = self.run_evaluation(epoch, test_data_loader, True)
+            early_stopping(test_loss, self.model, self.optimizer, epoch)
+            self.training_loss.append(train_loss)
+            self.train_acccuracy.append(train_accuracy)
+            self.test_loss.append(test_loss)
+            self.test_accuracy.append(test_accuracy)
+            print('End of Epoch: {}, train accuracy: {},  train Loss:  {}'.format(epoch, self.train_acccuracy, self.training_loss))
+            print('End of Epoch: {}, test accuracy: {},  test Loss:  {}'.format(epoch, self.test_accuracy, self.test_loss))
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
 
 
 dataset = "MNIST"
 #dataset = "MELTEST"
 
 if dataset == "MNIST":
-    mndata = MNIST('/Users/ragarwal/PycharmProjects/vajra/mnist-data')
+    mndata = MNIST('.././mnist-data')
     train_images, train_labels = mndata.load_training()
     val_images, val_labels = mndata.load_testing()
 
@@ -270,6 +396,8 @@ if dataset == "MNIST":
 
     driver = CapsuleNWDriver(mode = "train")
     driver.train(train_dataset, val_dataset)
+    print("test loss - {}".format(driver.test_loss))
+    print("test accuracy - {}".format(driver.test_accuracy))
 elif dataset == "MELTEST":
     train_data = [".././data/intro25-sonicide.npy"]*50
     labels = [1] * 50
@@ -277,8 +405,8 @@ elif dataset == "MELTEST":
     train_dataset = CustomDatasetMelTest(train_data, labels)
 
     configuration = CapsuleNetworkConfig()
-    configuration.input_height = 128
-    configuration.input_width = 776
+    configuration.input_height = 24
+    configuration.input_width = 80
 
     driver = CapsuleNWDriver(mode="train", configuration= configuration)
     driver.train(train_dataset, train_dataset)
