@@ -142,8 +142,8 @@ class ModelCheckPointer:
         filepath = os.path.join(checkpoint, 'last.pth.tar')
         if not os.path.exists(filepath):
             raise ("File doesn't exist {}".format(filepath))
-        checkpoint = torch.load(checkpoint)
-        model.load_state_dict(checkpoint['state_dict'], map_location=device)
+        checkpoint = torch.load(filepath, map_location=torch.device(device))
+        model.load_state_dict(checkpoint['state_dict'])
 
         if optimizer:
             optimizer.load_state_dict(checkpoint['optim_dict'])
