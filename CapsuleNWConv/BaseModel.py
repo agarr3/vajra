@@ -8,26 +8,6 @@ from torch.utils.data.sampler import SequentialSampler
 import numpy as np
 import os
 
-class CapsuleNW(torch.nn.Module):
-    def __init__(self):
-        super(CapsuleNW, self).__init__()
-        self.USE_CUDA = True if torch.cuda.is_available() else False
-        self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(28*28, 32),
-                                                 torch.nn.Sigmoid(),
-                                                 torch.nn.Linear(32, 10),
-                                                 torch.nn.Softmax())
-    def loss_fn(self, outputs, targets):
-        return torch.nn.BCEWithLogitsLoss()(outputs, targets)
-
-    def forward(self, inputs, labels=None):
-        outputs = self.decoder_layer(inputs)
-
-        if labels is not None:
-            loss = self.loss_fn(outputs, labels)
-
-        return outputs, loss
-
-
 class CapsuleNWConfiguration:
     EPOCHS = 50
     TRAIN_BATCH_SIZE = 500
@@ -35,6 +15,80 @@ class CapsuleNWConfiguration:
     LEARNING_RATE = 1e-05
 
     DETERMINISTIC = True
+
+    in_channels = 1
+    input_height = 28
+    input_width = 28
+
+    num_features_layer1 = 256
+    kernel_size_layer1 = 9
+    stride_layer1 = 1
+    padding_layer1 = 0
+
+    num_features_primary_cap = 32
+    primary_cap_dim = 8
+    kernel_size_layer2 = 9
+    stride_layer2 = 2
+    padding_layer2 = 0
+
+class CapsuleNW(torch.nn.Module):
+    def __init__(self, configuration = None):
+        super(CapsuleNW, self).__init__()
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if configuration:
+            self.configuration = configuration
+        else:
+            self.configuration = CapsuleNWConfiguration()
+
+        self.conv_layer_1 = torch.nn.Conv2d(in_channels=self.configuration.in_channels,
+                                            out_channels=self.configuration.num_features_layer1,
+                                            kernel_size=self.configuration.kernel_size_layer1,
+                                            stride=self.configuration.stride_layer1,
+                                            padding=self.configuration.padding_layer1)
+
+        self.conv_stack = torch.nn.ModuleList([torch.nn.Conv2d(in_channels=self.configuration.num_features_layer1,
+                                                               out_channels=self.configuration.num_features_primary_cap,
+                                                               kernel_size=self.configuration.kernel_size_layer2,
+                                                               stride=self.configuration.stride_layer2,
+                                                               padding=self.configuration.padding_layer2)
+                                               for _ in range(self.configuration.primary_cap_dim)])
+
+        self.configuration.first_filter_height = (int(
+            self.configuration.input_height - self.configuration.kernel_size_layer1 + 2 * self.configuration.padding_layer1) / self.configuration.stride_layer1) + 1
+        self.configuration.first_filter_width = (int(
+            self.configuration.input_width - self.configuration.kernel_size_layer1 + 2 * self.configuration.padding_layer1) / self.configuration.stride_layer1) + 1
+
+        self.configuration.second_filter_height = int((int(
+            self.configuration.first_filter_height - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
+        self.configuration.second_filter_width = int((int(
+            self.configuration.first_filter_width - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
+
+        self.configuration.primary_capsule_num = int(
+            self.configuration.second_filter_height * self.configuration.second_filter_width * self.configuration.num_features_primary_cap * self.configuration.primary_cap_dim)
+
+        self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(self.configuration.primary_capsule_num, 512),
+                                                 torch.nn.Sigmoid(),
+                                                 torch.nn.Linear(512, 10),
+                                                 torch.nn.Softmax())
+    def loss_fn(self, outputs, targets):
+        return torch.nn.BCEWithLogitsLoss()(outputs, targets)
+
+    def forward(self, inputs, labels=None):
+
+        batch_size = inputs.size(0)
+        conv_out_1 = torch.relu(self.conv_layer_1(inputs))
+        conv_out_2 = [conv(conv_out_1) for conv in self.conv_stack]
+
+        conv_out_2 = torch.stack(conv_out_2, dim=1)
+        conv_out_2 = conv_out_2.view(batch_size, -1)
+
+        outputs = self.decoder_layer(conv_out_2)
+
+        if labels is not None:
+            loss = self.loss_fn(outputs, labels)
+
+        return outputs, loss
 
 
 class CapsuleNWDriver:
@@ -160,7 +214,7 @@ class CustomDatasetMnist(Dataset):
     def __getitem__(self, index):
         data = self.data[index]
         data = torch.tensor(data, dtype=torch.float)
-        #data = data.view(self.channels, self.height, self.width)
+        data = data.view(self.channels, self.height, self.width)
 
         label = self.labels[index].float()
         return data, label
