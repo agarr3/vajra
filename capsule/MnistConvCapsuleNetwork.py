@@ -66,7 +66,7 @@ class _CapsuleNet(nn.Module):
 
 
 class MNISTCapsuleClassifierConfiguration:
-    epochs = 50
+    epochs = 2
     batch_size = 100
     lr = 0.001
     lr_decay = 0.9
@@ -136,7 +136,7 @@ class MNISTCapsuleClassifier:
             else:
                 x = Variable(x[:min(n_images, x.size(0))], volatile=True)
             _, x_recon = self.model(x)
-            data = np.concatenate([x.data, x_recon.data])
+            data = np.concatenate([x.data.cpu(), x_recon.data.cpu()])
             img = combine_images(np.transpose(data, [0, 2, 3, 1]))
             image = img * 255
             Image.fromarray(image.astype(np.uint8)).save(self.config.save_dir + "/real_and_recon.png")
@@ -200,6 +200,7 @@ class MNISTCapsuleClassifier:
                 loss.backward()  # backward, compute all gradients of loss w.r.t all Variables
                 training_loss += loss.data.item() * x.size(0)  # record the batch loss
                 optimizer.step()  # update the trainable parameters with computed gradients
+                print("epoch {}, minibatch {}, loss {}".format(epoch, i, loss.data.item()))
 
             # compute validation loss and acc
             val_loss, val_acc = self.test(test_loader)
@@ -242,15 +243,16 @@ if __name__ == "__main__":
         return train_loader, test_loader
 
 
-    mode = 'train'
+    mode = 'test'
     config = MNISTCapsuleClassifierConfiguration()
     train_loader, test_loader = load_mnist(config.data_dir, download=True, batch_size=config.batch_size)
     if mode == 'train':
         classifier = MNISTCapsuleClassifier(input_size=config.input_size, classes=config.classes,routings=config.routings,configuration=config)
         classifier.train(train_loader,test_loader)
+        classifier.show_reconstruction(test_loader, 50)
     elif mode == 'test':
         classifier = MNISTCapsuleClassifier(input_size=config.input_size, classes=config.classes,
                                             routings=config.routings, configuration=config, model_path=config.save_dir + '/trained_model.pkl')
-        classifier.train(train_loader, test_loader)
+        classifier.test(test_loader)
         classifier.show_reconstruction(test_loader, 50)
 
