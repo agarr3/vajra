@@ -12,7 +12,8 @@ class CapsuleNWConfiguration:
     EPOCHS = 50
     TRAIN_BATCH_SIZE = 500
     TEST_BATCH_SIZE = 500
-    LEARNING_RATE = 1e-05
+    LEARNING_RATE = 1e-01
+    SOFTMAX_FACTOR = 10
 
     DETERMINISTIC = True
 
@@ -30,6 +31,11 @@ class CapsuleNWConfiguration:
     kernel_size_layer2 = 9
     stride_layer2 = 2
     padding_layer2 = 0
+
+    secondary_capsule_dim = 16
+    secondary_capsule_number = 10
+
+    routing_iterations = 1
 
 class CapsuleNW(torch.nn.Module):
     def __init__(self, configuration = None):
@@ -65,14 +71,29 @@ class CapsuleNW(torch.nn.Module):
             self.configuration.first_filter_width - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
 
         self.configuration.primary_capsule_num = int(
-            self.configuration.second_filter_height * self.configuration.second_filter_width * self.configuration.num_features_primary_cap * self.configuration.primary_cap_dim)
+            self.configuration.second_filter_height * self.configuration.second_filter_width * self.configuration.num_features_primary_cap)
 
-        self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(self.configuration.primary_capsule_num, 512),
-                                                 torch.nn.Sigmoid(),
-                                                 torch.nn.Linear(512, 10),
-                                                 torch.nn.Softmax())
+        self.prediction_w = torch.nn.parameter.Parameter(torch.ones(
+            [self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number,
+             self.configuration.secondary_capsule_dim, self.configuration.primary_cap_dim]))
+
+        # self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(self.configuration.primary_capsule_num, 512),
+        #                                          torch.nn.Sigmoid(),
+        #                                          torch.nn.Linear(512, 10),
+        #                                          torch.nn.Softmax())
     def loss_fn(self, outputs, targets):
         return torch.nn.BCEWithLogitsLoss()(outputs, targets)
+
+    def safeNorm(self, tensor, dim, epsilon=1e-7, keepdim=True):
+        squared_norm = tensor.pow(2).sum(dim=dim, keepdim=keepdim)
+        safe_norm = torch.sqrt(squared_norm + epsilon)
+        return safe_norm, squared_norm
+
+    def squash(self, tensor, dim, keepdim=True):
+        safe_norm, squared_norm = self.safeNorm(tensor, dim=dim, keepdim=keepdim)
+        squash_factor = squared_norm / (1. + squared_norm)
+        unit_vector = tensor / safe_norm
+        return squash_factor * unit_vector
 
     def forward(self, inputs, labels=None):
 
@@ -81,9 +102,42 @@ class CapsuleNW(torch.nn.Module):
         conv_out_2 = [conv(conv_out_1) for conv in self.conv_stack]
 
         conv_out_2 = torch.stack(conv_out_2, dim=1)
-        conv_out_2 = conv_out_2.view(batch_size, -1)
+        conv_out_2 = conv_out_2.view(batch_size, -1, self.configuration.primary_cap_dim)
 
-        outputs = self.decoder_layer(conv_out_2)
+        primary_caps_vec = self.squash(conv_out_2, dim=-1)
+        #primary_caps_vec = conv_out_2.clone()
+
+        primary_caps_vec_tiled = torch.stack([primary_caps_vec] * self.configuration.secondary_capsule_number, dim=2)
+        primary_caps_vec_tiled = primary_caps_vec_tiled.unsqueeze(-1)
+
+        #W = torch.stack([self.prediction_w] * batch_size, dim=0)
+        u_hat = torch.matmul(self.prediction_w, primary_caps_vec_tiled)
+        u_hat_detach = u_hat.detach()
+
+        b_ij = torch.autograd.Variable(
+            torch.ones(batch_size, self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number,
+                        1, 1))
+        b_ij = b_ij.to(self.device)
+
+        for i in range(self.configuration.routing_iterations):
+            c_ij = torch.softmax(b_ij, dim=2)
+
+            if i == self.configuration.routing_iterations -1:
+                s_j = (c_ij * u_hat)
+                s_j = s_j.sum(dim=1, keepdim=True)
+                v_j = self.squash(s_j, dim=-2)
+            else:
+                s_j = (c_ij * u_hat_detach)
+                s_j = s_j.sum(dim=1, keepdim=True)
+                v_j = self.squash(s_j, dim=-2)
+                v_j_tiled = torch.cat([v_j] * self.configuration.primary_capsule_num, dim=1)
+                a_ij = torch.matmul(v_j_tiled.transpose(3, 4), u_hat_detach)
+                b_ij = b_ij + a_ij
+
+        v_k, _ = self.safeNorm(v_j, dim=-2, keepdim=True)
+        outputs = v_k.squeeze()
+
+        #outputs = self.decoder_layer(conv_out_2)
 
         if labels is not None:
             loss = self.loss_fn(outputs, labels)
@@ -168,6 +222,7 @@ class CapsuleNWDriver:
             correct_predictions = correct_predictions + (predictions == actuals).sum()
 
             print("for epoch {}, minibatch {}, the TRAIN loss is {}".format(epoch, step, loss.item()))
+            #print("at this point W is {}".format(self.model.prediction_w))
 
         accuracy = correct_predictions.data.item()/(len(train_data_loader)*train_data_loader.batch_size) * 100
 

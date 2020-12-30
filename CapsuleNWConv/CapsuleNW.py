@@ -68,93 +68,51 @@ class CapsuleNetwork(torch.nn.Module):
                          kernel_size=self.configuration.kernel_size_layer2, stride=self.configuration.stride_layer2, padding=self.configuration.padding_layer2)
                          for _ in range(self.configuration.primary_cap_dim)])
 
-        self.configuration.first_filter_height = (int(self.configuration.input_height - self.configuration.kernel_size_layer1 + 2 * self.configuration.padding_layer1)/ self.configuration.stride_layer1 ) + 1
-        self.configuration.first_filter_width = (int(self.configuration.input_width - self.configuration.kernel_size_layer1 + 2 * self.configuration.padding_layer1) / self.configuration.stride_layer1) + 1
+        self.configuration.first_filter_height = (int(
+            self.configuration.input_height - self.configuration.kernel_size_layer1 + 2 * self.configuration.padding_layer1) / self.configuration.stride_layer1) + 1
+        self.configuration.first_filter_width = (int(
+            self.configuration.input_width - self.configuration.kernel_size_layer1 + 2 * self.configuration.padding_layer1) / self.configuration.stride_layer1) + 1
 
-        self.configuration.second_filter_height = int((int(self.configuration.first_filter_height - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
-        self.configuration.second_filter_width = int((int(self.configuration.first_filter_width - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
+        self.configuration.second_filter_height = int((int(
+            self.configuration.first_filter_height - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
+        self.configuration.second_filter_width = int((int(
+            self.configuration.first_filter_width - self.configuration.kernel_size_layer2 + 2 * self.configuration.padding_layer2) / self.configuration.stride_layer2) + 1)
 
-        self.configuration.primary_capsule_num = int(self.configuration.second_filter_height * self.configuration.second_filter_width * self.configuration.num_features_primary_cap)
+        self.configuration.primary_capsule_num = int(
+            self.configuration.second_filter_height * self.configuration.second_filter_width * self.configuration.num_features_primary_cap * self.configuration.primary_cap_dim)
 
-        self.prediction_w = torch.nn.parameter.Parameter(torch.ones([self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number, self.configuration.secondary_capsule_dim, self.configuration.primary_cap_dim]).to(self.device))
-
-        self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(self.configuration.secondary_capsule_number * self.configuration.secondary_capsule_dim, 512),
+        self.decoder_layer = torch.nn.Sequential(torch.nn.Linear(self.configuration.primary_capsule_num , 512),
                                       torch.nn.ReLU(inplace=True),
                                       torch.nn.Linear(512, 1024),
                                       torch.nn.ReLU(inplace=True),
-                                      torch.nn.Linear(1024, self.configuration.input_height * self.configuration.input_width),
+                                      torch.nn.Linear(1024, self.configuration.secondary_capsule_number),
                                       torch.nn.Sigmoid())
+
+    def loss_fn(self, outputs, targets):
+        return torch.nn.BCEWithLogitsLoss()(outputs, targets)
 
     def forward(self, input, labels = None):
 
+        batch_size = input.size(0)
         conv_out_1 = torch.relu(self.conv_layer_1(input))
         conv_out_2 = [conv(conv_out_1) for conv in self.conv_stack]
 
         conv_out_2 = torch.stack(conv_out_2, dim =1)
-        conv_out_2 = conv_out_2.view(conv_out_2.size(0),-1,self.configuration.primary_cap_dim)
+        conv_out_2 = conv_out_2.view(batch_size,-1)
 
-        primary_caps_vec = self.squash(conv_out_2, dim=-1)
+        output = self.decoder_layer(conv_out_2)
+        _, predictions = output.max(dim=1)
 
-        primary_caps_vec_tiled = torch.stack([primary_caps_vec] * self.configuration.secondary_capsule_number, dim=2)
-        primary_caps_vec_tiled = primary_caps_vec_tiled.unsqueeze(-1)
-
-        batch_size = input.size(0)
-        W = torch.stack([self.prediction_w] * batch_size, dim=0)
-        u_hat = torch.matmul(W, primary_caps_vec_tiled)
-
-        b_ij = torch.autograd.Variable(torch.zeros(batch_size, self.configuration.primary_capsule_num, self.configuration.secondary_capsule_number, 1, 1))
-
-        if USE_CUDA:
-            b_ij = b_ij.cuda()
-
-        for i in range(self.configuration.routing_iterations):
-            c_ij = torch.softmax(b_ij, dim=2)
-            s_j = (c_ij * u_hat)
-            s_j = s_j.sum(dim=1, keepdim=True)
-            v_j = self.squash(s_j, dim=-2)
-            v_j_tiled = torch.cat([v_j] * self.configuration.primary_capsule_num, dim=1)
-            a_ij = torch.matmul(v_j_tiled.transpose(3, 4), u_hat)
-            b_ij = b_ij + a_ij
-
-        v_k, _ = self.safeNorm(v_j, dim=-2, keepdim=True)
-        # prediction = torch.squeeze(v_k)
-        #
-        # predictionList = []
-        # for predictionForSingleInput in prediction:
-        #     predictionList.append(torch.argmax(predictionForSingleInput))
-
-        margin_loss = 0
         if labels is not None:
             T = torch.eye(10)
             if USE_CUDA:
                 T = T.cuda()
             T = T.index_select(dim=0, index=labels)
-            correct_loss = torch.relu(self.configuration.m_plus - v_k).pow(2).view(batch_size, -1)
-            incorrect_loss = torch.relu(v_k - self.configuration.m_minus).pow(2).view(batch_size, -1)
-            margin_loss = T * correct_loss + self.configuration.lambda_ * (1 - T) * incorrect_loss
-            margin_loss = margin_loss.sum(dim=1).mean()
+            loss = self.loss_fn(output, T)
+
+        return loss, output, predictions
 
 
-        v_j = v_j.squeeze(1)
-        classes = torch.sqrt((v_j ** 2).sum(dim=2, keepdim=False))
-        _, max_length_indices = classes.max(dim=1)
-        masked = torch.autograd.Variable(torch.eye(10))
-        if USE_CUDA:
-            masked = masked.cuda()
-        masked = masked.index_select(dim=0, index=max_length_indices.squeeze(1).data)
-        decoder_input = v_j * masked[:, :, None, None]
-
-        decoder_input = decoder_input.view(batch_size, -1)
-        decoder_output = self.decoder_layer(decoder_input)
-
-        if labels is None:
-            self.configuration.alpha = 1
-
-        mse = torch.nn.MSELoss()
-        reconstruction_loss = mse(decoder_output, input.view(batch_size, -1))
-        final_loss = margin_loss + (self.configuration.alpha * reconstruction_loss)
-
-        return torch.squeeze(max_length_indices, dim=-1), final_loss, decoder_output
 
     def predict(self, inputs):
         with torch.no_grad():
@@ -163,8 +121,8 @@ class CapsuleNetwork(torch.nn.Module):
                 label = inputs['labels']
             else:
                 label = None
-            predictions, loss, decoder_output = self.forward(input, label)
-            return predictions, loss, decoder_output
+            loss, output, predictions = self.forward(input, label)
+            return loss, output, predictions
 
 
 
@@ -264,8 +222,8 @@ class CapsuleNWDriver:
 
     def predict(self, input):
         self.model.eval()
-        predictions, loss, decoder_output = self.model.predict(input)
-        return predictions.detach(), loss.detach(), decoder_output.detach()
+        loss, output, predictions = self.model.predict(input)
+        return predictions.detach(), loss.detach(), output.detach()
 
     def run_evaluation(self, epoch, test_data_loader, save_reconstruction=False):
 
@@ -300,7 +258,7 @@ class CapsuleNWDriver:
                     "input": data
                 }
 
-            predictions, loss, decoder_output = self.predict(inputs)
+            loss, output, predictions = self.predict(inputs)
             total_test_loss = total_test_loss + loss.item()
 
             if all(labelFlag):
@@ -309,12 +267,12 @@ class CapsuleNWDriver:
             print('Epoch: {}, step: {},  Loss:  {}'.format(epoch, step, loss.item()))
             global_step = global_step + 1
             local_step=0
-            if save_reconstruction:
-                for image, label in zip(decoder_output, label):
-                    local_step = local_step + 1
-                    image = image.view(self.configuration.input_height, self.configuration.input_width)
-                    img_name = os.path.join(target_dir, "global_step_{}_local_step_{}_label_{}.png".format(global_step,local_step, label))
-                    save_image(image, str(img_name))
+            # if save_reconstruction:
+            #     for image, label in zip(decoder_output, label):
+            #         local_step = local_step + 1
+            #         image = image.view(self.configuration.input_height, self.configuration.input_width)
+            #         img_name = os.path.join(target_dir, "global_step_{}_local_step_{}_label_{}.png".format(global_step,local_step, label))
+            #         save_image(image, str(img_name))
 
         accuracy = total_test_accurate_matches / len(test_data_loader)
         return total_test_loss,accuracy.cpu().numpy() , all(labelFlag)
@@ -343,7 +301,7 @@ class CapsuleNWDriver:
                     "input": data
                 }
 
-            predictions, loss, decoder_output = self.model(**inputs)
+            loss, output, predictions = self.model(**inputs)
             total_train_loss = total_train_loss + loss.item()
             loss.backward()
             self.optimizer.step()
@@ -400,8 +358,8 @@ if dataset == "MNIST":
     train_dataset = CustomDatasetMnist(train_images, train_labels, 1, 28, 28)
     val_dataset = CustomDatasetMnist(val_images, val_labels, 1, 28, 28)
 
-    driver = CapsuleNWDriver(mode = "train", modelPath='/Users/ragarwal/PycharmProjects/vajra/models/mnist')
-    #driver = CapsuleNWDriver(mode="train")
+    #driver = CapsuleNWDriver(mode = "train", modelPath='/Users/ragarwal/PycharmProjects/vajra/models/mnist')
+    driver = CapsuleNWDriver(mode="train")
     driver.train(train_dataset, val_dataset)
     print("test loss - {}".format(driver.test_loss))
     print("test accuracy - {}".format(driver.test_accuracy))
