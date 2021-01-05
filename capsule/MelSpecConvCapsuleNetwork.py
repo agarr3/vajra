@@ -5,10 +5,44 @@ from torch import nn
 from torch.optim import Adam, lr_scheduler
 from torch.autograd import Variable
 from torchvision import transforms, datasets
+from torch.utils.data import Dataset
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.sampler import SequentialSampler
 
 from capsuleclassification import DenseCapsule
 from feature_extraction_capsule_layers import FeatureExtractionConvolution
+import numpy as np
 
+class MNISTCapsuleClassifierConfiguration:
+    epochs = 2
+    batch_size = 2
+    lr = 0.001
+    lr_decay = 0.9
+    lam_recon = 0.0005 * 784
+    routings = 3
+    shift_pixels = 2
+    data_dir = './data'
+    download = True
+    save_dir = './result/mel'
+
+    input_size=[1, 24, 776]
+    classes = 10
+    routings = 3
+
+    first_layer_kernel_size = 9
+    first_layer_stride = 1
+    first_layer_padding = 0
+    first_layer_num_filters = 256
+
+    second_layer_kernel_size = 9
+    second_layer_stride = 2
+    second_layer_padding = 0
+    second_layer_num_filters = 256
+
+    feature_dimension = 8
+    output_dimension = 16
+
+    supervised = False
 
 class _CapsuleNet(nn.Module):
     """
@@ -21,26 +55,54 @@ class _CapsuleNet(nn.Module):
         - Output:((batch, classes), (batch, channels, width, height))
     """
 
-    def __init__(self, input_size, classes, routings):
+    def __init__(self, input_size, classes, routings, configuration=None):
         super(_CapsuleNet, self).__init__()
         self.input_size = input_size
         self.classes = classes
         self.routings = routings
         self.USE_CUDA = torch.cuda.is_available()
 
+        if configuration:
+            self.config = configuration
+        else:
+            self.config = MNISTCapsuleClassifierConfiguration()
+
         # Layer 1: Just a conventional Conv2D layer
-        self.conv1 = nn.Conv2d(input_size[0], 256, kernel_size=9, stride=1, padding=0)
+        self.conv1 = nn.Conv2d(input_size[0], self.config.first_layer_num_filters,
+                               kernel_size=self.config.first_layer_kernel_size, stride=self.config.first_layer_stride,
+                               padding=self.config.first_layer_padding)
 
         # Layer 2: Conv2D layer with `squash` activation, then reshape to [None, num_caps, dim_caps]
-        self.primarycaps = FeatureExtractionConvolution(256, 256, 8, kernel_size=9, stride=2, padding=0)
+        self.primarycaps = FeatureExtractionConvolution(self.config.first_layer_num_filters,
+                                                        self.config.second_layer_num_filters,
+                                                        self.config.feature_dimension,
+                                                        kernel_size=self.config.second_layer_kernel_size,
+                                                        stride=self.config.second_layer_stride,
+                                                        padding=self.config.second_layer_padding)
+
+        first_layer_op_height = (int(
+            input_size[1] - self.config.first_layer_kernel_size + 2 * self.config.first_layer_padding) / self.config.first_layer_stride) + 1
+
+        first_layer_op_width = (int(
+            input_size[2] - self.config.first_layer_kernel_size + 2 * self.config.first_layer_padding) / self.config.first_layer_stride) + 1
+
+        seconf_layer_op_height = int((int(
+            first_layer_op_height - self.config.second_layer_kernel_size + 2 * self.config.second_layer_padding) / self.config.second_layer_stride) + 1)
+
+        seconf_layer_op_width = int((int(
+            first_layer_op_width - self.config.second_layer_kernel_size + 2 * self.config.second_layer_padding) / self.config.second_layer_stride) + 1)
+
+        primary_capsule_num = int(
+            seconf_layer_op_height * seconf_layer_op_width * self.config.second_layer_num_filters / self.config.feature_dimension)
+
 
         # Layer 3: Capsule layer. Routing algorithm works here.
-        self.digitcaps = DenseCapsule(in_num_caps=32 * 6 * 6, in_dim_caps=8,
-                                      out_num_caps=classes, out_dim_caps=16, routings=routings)
+        self.digitcaps = DenseCapsule(in_num_caps=primary_capsule_num, in_dim_caps=self.config.feature_dimension,
+                                      out_num_caps=classes, out_dim_caps=self.config.output_dimension, routings=routings)
 
         # Decoder network.
         self.decoder = nn.Sequential(
-            nn.Linear(16 * classes, 512),
+            nn.Linear(self.config.output_dimension * classes, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, 1024),
             nn.ReLU(inplace=True),
@@ -61,25 +123,12 @@ class _CapsuleNet(nn.Module):
                 y = Variable(torch.zeros(length.size()).scatter_(1, index.view(-1, 1).cpu().data, 1.).cuda())
             else:
                 y = Variable(torch.zeros(length.size()).scatter_(1, index.view(-1, 1).cpu().data, 1.))
-        reconstruction = self.decoder((x * y[:, :, None]).view(x.size(0), -1))
+        if self.config.supervised:
+            reconstruction = self.decoder((x * y[:, :, None]).view(x.size(0), -1))
+        else:
+            reconstruction = self.decoder(x.view(x.size(0), -1))
+
         return length, reconstruction.view(-1, *self.input_size)
-
-
-class MNISTCapsuleClassifierConfiguration:
-    epochs = 50
-    batch_size = 100
-    lr = 0.001
-    lr_decay = 0.9
-    lam_recon = 0.0005 * 784
-    routings = 3
-    shift_pixels = 2
-    data_dir = './data',
-    download = True
-    save_dir = './result'
-
-    input_size=[1, 28, 28]
-    classes = 10
-    routings = 3
 
 
 class MNISTCapsuleClassifier:
@@ -105,7 +154,7 @@ class MNISTCapsuleClassifier:
         if model_path:
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
 
-    def caps_loss(self, y_true, y_pred, x, x_recon, lam_recon):
+    def caps_loss(self, y_true, y_pred, x, x_recon, lam_recon, supervised = True):
         """
         Capsule loss = Margin loss + lam_recon * reconstruction loss.
         :param y_true: true labels, one-hot coding, size=[batch, classes]
@@ -120,8 +169,10 @@ class MNISTCapsuleClassifier:
         L_margin = L.sum(dim=1).mean()
 
         L_recon = nn.MSELoss()(x_recon, x)
-
-        return L_margin + lam_recon * L_recon
+        if supervised:
+            return L_margin + lam_recon * L_recon
+        else:
+            return L_recon
 
     def show_reconstruction(self, test_loader, n_images):
         import matplotlib.pyplot as plt
@@ -136,7 +187,7 @@ class MNISTCapsuleClassifier:
             else:
                 x = Variable(x[:min(n_images, x.size(0))], volatile=True)
             _, x_recon = self.model(x)
-            data = np.concatenate([x.data, x_recon.data])
+            data = np.concatenate([x.data.cpu(), x_recon.data.cpu()])
             img = combine_images(np.transpose(data, [0, 2, 3, 1]))
             image = img * 255
             Image.fromarray(image.astype(np.uint8)).save(self.config.save_dir + "/real_and_recon.png")
@@ -158,7 +209,7 @@ class MNISTCapsuleClassifier:
             else:
                 x, y = Variable(x, volatile=True), Variable(y)
             y_pred, x_recon = self.model(x)
-            test_loss += self.caps_loss(y, y_pred, x, x_recon, self.config.lam_recon).data.item() * x.size(0)  # sum up batch loss
+            test_loss += self.caps_loss(y, y_pred, x, x_recon, self.config.lam_recon, self.config.supervised).data.item() * x.size(0)  # sum up batch loss
             y_pred = y_pred.data.max(1)[1]
             y_true = y.data.max(1)[1]
             correct += y_pred.eq(y_true).cpu().sum()
@@ -182,6 +233,7 @@ class MNISTCapsuleClassifier:
         optimizer = Adam(self.model.parameters(), lr=self.config.lr)
         lr_decay = lr_scheduler.ExponentialLR(optimizer, gamma=self.config.lr_decay)
         best_val_acc = 0.
+        best_val_loss = np.inf
         for epoch in range(self.config.epochs):
             self.model.train()  # set to training mode
             lr_decay.step()  # decrease the learning rate by multiplying a factor `gamma`
@@ -196,20 +248,28 @@ class MNISTCapsuleClassifier:
 
                 optimizer.zero_grad()  # set gradients of optimizer to zero
                 y_pred, x_recon = self.model(x, y)  # forward
-                loss = self.caps_loss(y, y_pred, x, x_recon, self.config.lam_recon)  # compute loss
+                loss = self.caps_loss(y, y_pred, x, x_recon, self.config.lam_recon, self.config.supervised)  # compute loss
                 loss.backward()  # backward, compute all gradients of loss w.r.t all Variables
                 training_loss += loss.data.item() * x.size(0)  # record the batch loss
                 optimizer.step()  # update the trainable parameters with computed gradients
+                print("epoch {}, minibatch {}, loss {}".format(epoch, i, loss.data.item()))
 
             # compute validation loss and acc
             val_loss, val_acc = self.test(test_loader)
             print("==> Epoch %02d: loss=%.5f, val_loss=%.5f, val_acc=%.4f, time=%ds"
                   % (epoch, training_loss / len(train_loader.dataset),
                      val_loss, val_acc, time() - ti))
-            if val_acc > best_val_acc:  # update best validation acc and save model
-                best_val_acc = val_acc
-                torch.save(self.model.state_dict(), self.config.save_dir + '/epoch%d.pkl' % epoch)
-                print("best val_acc increased to %.4f" % best_val_acc)
+            if self.config.supervised:
+                if val_acc > best_val_acc:  # update best validation acc and save model
+                    best_val_acc = val_acc
+                    torch.save(self.model.state_dict(), self.config.save_dir + '/epoch%d.pkl' % epoch)
+                    print("best val_acc increased to %.4f" % best_val_acc)
+            else:
+                if val_loss < best_val_loss:  # update best validation acc and save model
+                    best_val_loss = val_loss
+                    torch.save(self.model.state_dict(), self.config.save_dir + '/epoch%d.pkl' % epoch)
+                    print("best val_loss decreased to %.4f" % best_val_loss)
+
         torch.save(self.model.state_dict(), self.config.save_dir + '/trained_model.pkl')
         print('Trained model saved to \'%s/trained_model.h5\'' % self.config.save_dir)
         print("Total time = %ds" % (time() - t0))
@@ -225,17 +285,18 @@ class CustomDatasetMelTest(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
+        import numpy as np
         fileName = self.data[index]
         # featureExtractor = ExtractorFactory.getExtractor(feature=FEATURES.LOG_MEL_SPECTOGRAM)
         # mel_spect, sr = featureExtractor.convertSingleAudioFile(audio_file_path=fileName)
 
         mel_spect = np.load(fileName)
-        data = torch.tensor(mel_spect[:24,:80], dtype=torch.float)
+        data = torch.tensor(mel_spect[:,:], dtype=torch.float)
         data = torch.unsqueeze(data, dim =0)
 
         label = torch.tensor(self.labels[index])
 
-        return data, label, False
+        return data, label
 
 if __name__ == "__main__":
     def load_mnist(path='./data', download=False, batch_size=100, shift_pixels=2):
@@ -263,19 +324,37 @@ if __name__ == "__main__":
 
 
     mode = 'train'
+    data = "mel"
     config = MNISTCapsuleClassifierConfiguration()
 
-    train_data = [".././data/intro25-sonicide.npy"] * 50
-    labels = [1] * 50
+    if data == "mel":
+        train_data = [".././data/intro25-sonicide.npy"] * 500
+        labels = [1] * 500
 
-    train_dataset = CustomDatasetMelTest(train_data, labels)
+        train_dataset = CustomDatasetMelTest(train_data, labels)
+        test_data_set = CustomDatasetMelTest(train_data, labels)
+
+        train_loader = DataLoader(train_dataset,
+                                       batch_size=config.batch_size,
+                                       sampler=SequentialSampler(train_dataset), drop_last=False)
+
+        test_loader = DataLoader(test_data_set,
+                                      batch_size=config.batch_size,
+                                      sampler=SequentialSampler(test_data_set), drop_last=False)
+    elif data == "mnist":
+        config.input_size = [1, 28, 28]
+        config.save_dir = './result/mnist'
+        config.batch_size=100
+        config.supervised = True
+        train_loader, test_loader = load_mnist(config.data_dir, download=True, batch_size=config.batch_size)
 
     if mode == 'train':
         classifier = MNISTCapsuleClassifier(input_size=config.input_size, classes=config.classes,routings=config.routings,configuration=config)
         classifier.train(train_loader,test_loader)
+        classifier.show_reconstruction(test_loader, 50)
     elif mode == 'test':
         classifier = MNISTCapsuleClassifier(input_size=config.input_size, classes=config.classes,
                                             routings=config.routings, configuration=config, model_path=config.save_dir + '/trained_model.pkl')
-        classifier.train(train_loader, test_loader)
+        classifier.test(test_loader)
         classifier.show_reconstruction(test_loader, 50)
 
